@@ -85,6 +85,9 @@ class ethplorerController {
     }
 
     public function sendResult(array $result){
+        if($this->getRequest('debugId')){
+            $result['debug'] = $this->db->getDebugData();
+        }
         echo json_encode($result, JSON_UNESCAPED_SLASHES);
         die();
     }
@@ -111,9 +114,13 @@ class ethplorerController {
             $key = in_array($command, $this->apiCommands) ? $this->getRequest('apiKey', FALSE) : $this->getPostRequest('apiKey', FALSE);
             if(!$key || !$this->db->checkAPIkey($key)){
                 $this->sendError(1, 'Invalid API key');
-            }            
+            }
             $this->defaults = $this->db->getAPIKeyDefaults($key, $command);
 
+            if($this->db->isSuspendedAPIKey($key)){
+                $this->sendError(133, 'API key temporary suspended. Contact support.');
+            }
+            
             if(in_array($command, $this->apiPostCommands)){
                 // @todo: Temporary solution, special key property will be used later
                 if($key == "freekey"){
@@ -123,15 +130,17 @@ class ethplorerController {
                 return $result;
             }
 
-            $timestamp = $this->getRequest('timestamp', FALSE);
-            if(FALSE !== $timestamp){
+            $timestamp = $this->getRequest('ts', FALSE);
+            $needCache = (FALSE !== $timestamp) || ($command === 'getAddressHistory');
+
+            if($needCache){
                 $cacheId = 'API-' . $command  . '-' . md5($_SERVER["REQUEST_URI"]);
                 $oCache = $this->db->getCache();
                 $result = $oCache->get($cacheId, FALSE, TRUE, 15);
             }
             if(!$result){
                 $result = call_user_func(array($this, $command));
-                if((FALSE !== $timestamp) && $cacheId && (FALSE !== $result)){
+                if($needCache && $cacheId && (FALSE !== $result)){
                     $oCache->save($cacheId, $result);
                 }
             }
@@ -181,6 +190,7 @@ class ethplorerController {
         $address = $this->getParam(0, '');
         $address = strtolower($address);
         $onlyToken = $this->getRequest('token', FALSE);
+        $showETHTotals = !!$this->getRequest('showETHTotals', FALSE);
         if((FALSE === $address)){
             $this->sendError(103, 'Missing address');
         }
@@ -188,18 +198,26 @@ class ethplorerController {
         if(!$this->db->isValidAddress($address) || ($onlyToken && !$this->db->isValidAddress($onlyToken))){
             $this->sendError(104, 'Invalid address format');
         }
+        $balance = $this->db->getBalance($address);
         $result = array(
             'address' => $address,
             'ETH' => array(
-                'balance'   => $this->db->getBalance($address),
-                'totalIn'   => 0,
-                'totalOut'  => 0,
+                'balance'   => $balance
             ),
             'countTxs' => $this->db->countTransactions($address)
         );
-        if($result['countTxs'] && ($result['countTxs'] < 10000)){
-            $out = $this->db->getEtherTotalOut($address);
-            $result['ETH']['totalIn'] = $result['ETH']['balance'] + $out;
+        if($showETHTotals){
+            $in = 0;
+            $out = 0;
+            if($result['countTxs']){
+                $in = $this->db->getEtherTotalIn($address, FALSE, !$this->db->isHighloadedAddress($address));
+                $out = $in - $balance;
+                if($out < 0){
+                    $in = $balance;
+                    $out = 0;
+                }
+            }
+            $result['ETH']['totalIn'] = $in;
             $result['ETH']['totalOut'] = $out;
         }
         if($contract = $this->db->getContract($address)){
@@ -224,7 +242,7 @@ class ethplorerController {
                         continue;
                     }
                 }
-                $token = $this->db->getToken($balance['contract']);
+                $token = $this->db->getToken($balance['contract'], TRUE);
                 if($token){
                     unset($token['checked']);
                     unset($token['txsCount']);
@@ -286,7 +304,7 @@ class ethplorerController {
         $operations = $this->db->getOperations($txHash);
         if(is_array($operations) && !empty($operations)){
             foreach($operations as $i => $operation){
-                $token = $this->db->getToken($operation['contract']);
+                $token = $this->db->getToken($operation['contract'], TRUE);
                 if($token && is_array($token)){
                     unset($token['checked']);
                     unset($token['txsCount']);
@@ -339,8 +357,9 @@ class ethplorerController {
 
         $maxLimit = is_array($this->defaults) && isset($this->defaults['limit']) ? $this->defaults['limit'] : 50;
         $limit = max(min(abs((int)$this->getRequest('limit', 10)), $maxLimit), 1);
+        $timestamp = $this->_getTimestampParam();
         $showZeroValues = !!$this->getRequest('showZeroValues', FALSE);
-        $result = $this->db->getTransactions($address, $limit, $showZeroValues);
+        $result = $this->db->getTransactions($address, $limit, $timestamp, $showZeroValues);
 
         $this->sendResult($result);
     }
@@ -461,7 +480,7 @@ class ethplorerController {
      * @return array
      */
     public function getTokenPriceHistoryGrouped(){
-        $period = min(abs((int)$this->getRequest('period', 365)), 365);
+        $period = abs((int)$this->getRequest('period', 365));
         if($period <= 0) $period = 365;
         $address = $this->getParam(0, FALSE);
         if($address){
@@ -488,7 +507,8 @@ class ethplorerController {
                 $this->sendError(104, 'Invalid address format');
             }
         }
-        $result = array('history' => $this->db->getAddressPriceHistoryGrouped($address));
+        $withEth = !!$this->getRequest('withEth', FALSE);
+        $result = array('history' => $this->db->getAddressPriceHistoryGrouped($address, FALSE, $withEth));
         if(isset($result['history']['cache'])) $this->cacheState = $result['history']['cache'];
         else $this->cacheState = '';
         $this->sendResult($result);
@@ -620,12 +640,10 @@ class ethplorerController {
         $options = array(
             'type'      => $this->getRequest('type', FALSE),
             'limit'     => max(min(abs((int)$this->getRequest('limit', 10)), $maxLimit), 1),
+            'timestamp' => $this->_getTimestampParam()
         );
         if(FALSE !== $address){
             $options['address'] = $address;
-        }
-        if(FALSE !== $this->getRequest('timestamp', FALSE)){
-            $options['timestamp'] = (int)$this->getRequest('timestamp');
         }
         if($addressHistoryMode){
             $token = $this->getRequest('token', FALSE);
@@ -663,6 +681,18 @@ class ethplorerController {
             }
         }
         return $result;
+    }
+
+    protected function _getTimestampParam(){
+        $timestamp = (int)$this->getRequest('timestamp', 0);
+        if($timestamp > 0){
+            $maxPeriod = is_array($this->defaults) && isset($this->defaults['maxPeriod']) ? $this->defaults['maxPeriod'] : 2592000;
+            if((time() - $timestamp) > $maxPeriod){
+                $this->sendError(108, 'Invalid timestamp');
+            }
+            return $timestamp;
+        }
+        return 0;
     }
 
     /**
